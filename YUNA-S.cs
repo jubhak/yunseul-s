@@ -1694,7 +1694,7 @@ internal class YunaS : Form
 
 	private const int CW = 388;
 
-	private const string POS = "D:\\workspace\\claude\\pos.json";
+	private const string POS = "pos.json";
 
 	private HwCollector _hw;
 
@@ -2315,6 +2315,8 @@ internal class YunaS : Form
 			dW.Pct.Text = (int)disk.UsePct + "%";
 			dW.Size.Text = Fmt.Bytes((double)disk.UsedGB * 1000000000.0) + "/" + Fmt.Bytes((double)disk.TotalGB * 1000000000.0);
 			dW.IO.Text = "R:" + Fmt.Speed(disk.ReadBps) + " W:" + Fmt.Speed(disk.WriteBps);
+			bool ioActive = disk.ReadBps > 0 || disk.WriteBps > 0;
+			dW.IO.BackColor = ioActive ? Color.FromArgb(60, Clr.YELLOW) : Color.Transparent;
 			if (disk.Temp.HasValue && disk.Temp > 0f)
 			{
 				dW.Temp.Text = (int)disk.Temp.Value + "°C";
@@ -2444,7 +2446,7 @@ internal class YunaS : Form
 	{
 		try
 		{
-			string input = File.ReadAllText("D:\\workspace\\claude\\pos.json");
+			string input = File.ReadAllText(Path.Combine(Program.BASE, POS));
 			Match match = Regex.Match(input, "\"x\"\\s*:\\s*(-?\\d+)");
 			Match match2 = Regex.Match(input, "\"y\"\\s*:\\s*(-?\\d+)");
 			if (match.Success && match2.Success)
@@ -2469,7 +2471,7 @@ internal class YunaS : Form
 	{
 		try
 		{
-			File.WriteAllText("D:\\workspace\\claude\\pos.json", "{\"x\":" + x + ",\"y\":" + y + "}");
+			File.WriteAllText(Path.Combine(Program.BASE, POS), "{\"x\":" + x + ",\"y\":" + y + "}");
 		}
 		catch
 		{
