@@ -1,2 +1,5 @@
 bin/
 obj/
+pos.json
+*-crash.txt
+sensors_dump.txt
