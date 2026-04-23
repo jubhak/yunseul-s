@@ -2316,7 +2316,7 @@ internal class YunaS : Form
 			dW.Size.Text = Fmt.Bytes((double)disk.UsedGB * 1000000000.0) + "/" + Fmt.Bytes((double)disk.TotalGB * 1000000000.0);
 			dW.IO.Text = "R:" + Fmt.Speed(disk.ReadBps) + " W:" + Fmt.Speed(disk.WriteBps);
 			bool ioActive = disk.ReadBps > 0 || disk.WriteBps > 0;
-			dW.IO.BackColor = ioActive ? Color.FromArgb(60, Clr.YELLOW) : Color.Transparent;
+			dW.IO.BackColor = ioActive ? Color.FromArgb(180, 80, 60, 0) : Color.Transparent;
 			if (disk.Temp.HasValue && disk.Temp > 0f)
 			{
 				dW.Temp.Text = (int)disk.Temp.Value + "°C";
