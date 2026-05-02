@@ -78,7 +78,7 @@ internal static class Program
 			main.Opacity = 0.0;
 			main.DataReady += delegate
 			{
-				main.Opacity = 0.95;
+				main.Opacity = 1.0;
 				System.Windows.Forms.Timer fadeDelay = new System.Windows.Forms.Timer
 				{
 					Interval = 1000
@@ -1469,7 +1469,7 @@ internal class SplashForm : Form
 		base.Size = new Size(180, 180);
 		base.TopMost = true;
 		base.ShowInTaskbar = false;
-		base.Opacity = 0.95;
+		base.Opacity = 1.0;
 		SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.DoubleBuffer | ControlStyles.OptimizedDoubleBuffer, value: true);
 		_pulse = 0.5f;
 		_ring = 0f;
@@ -1746,7 +1746,7 @@ internal class YunaS : Form
 		base.FormBorderStyle = FormBorderStyle.None;
 		BackColor = Clr.BG;
 		base.TopMost = true;
-		base.Opacity = 0.95;
+		base.Opacity = 1.0;
 		base.StartPosition = FormStartPosition.Manual;
 		base.ShowInTaskbar = false;
 		base.AutoScaleMode = AutoScaleMode.None;
@@ -2316,7 +2316,8 @@ internal class YunaS : Form
 			dW.Size.Text = Fmt.Bytes((double)disk.UsedGB * 1000000000.0) + "/" + Fmt.Bytes((double)disk.TotalGB * 1000000000.0);
 			dW.IO.Text = "R:" + Fmt.Speed(disk.ReadBps) + " W:" + Fmt.Speed(disk.WriteBps);
 			bool ioActive = disk.ReadBps > 0 || disk.WriteBps > 0;
-			dW.IO.BackColor = ioActive ? Color.FromArgb(180, 80, 60, 0) : Color.Transparent;
+			dW.IO.BackColor = ioActive ? Color.FromArgb(255, 200, 180, 0) : Color.Transparent;
+			dW.IO.ForeColor = ioActive ? Color.Black : Clr.CYAN;
 			if (disk.Temp.HasValue && disk.Temp > 0f)
 			{
 				dW.Temp.Text = (int)disk.Temp.Value + "°C";
