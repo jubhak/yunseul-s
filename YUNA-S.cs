@@ -458,37 +458,65 @@ internal class HwCollector : IDisposable
 	{
 		try
 		{
-			nint num = CreateFileW("\\\\.\\PhysicalDrive" + physIdx, 0u, 3u, IntPtr.Zero, 3u, 0u, IntPtr.Zero);
+			// GENERIC_READ(0x80000000) 권한으로 열기 시도 (일부 디스크에서 필요)
+			nint num = CreateFileW("\\\\.\\PhysicalDrive" + physIdx, 0x80000000u, 3u, IntPtr.Zero, 3u, 0u, IntPtr.Zero);
+			if (((IntPtr)num).ToInt64() == -1)
+			{
+				// 권한 없이 재시도
+				num = CreateFileW("\\\\.\\PhysicalDrive" + physIdx, 0u, 3u, IntPtr.Zero, 3u, 0u, IntPtr.Zero);
+			}
 			if (((IntPtr)num).ToInt64() == -1)
 			{
 				return null;
 			}
 			try
 			{
+				// StorageDeviceTemperatureProperty (PropertyId=22)
 				byte[] lpInBuffer = new byte[8] { 22, 0, 0, 0, 0, 0, 0, 0 };
 				byte[] array = new byte[1024];
 				uint lpBytesReturned = 0u;
-				if (!DeviceIoControl(num, 2954240u, lpInBuffer, 8u, array, (uint)array.Length, ref lpBytesReturned, IntPtr.Zero))
+				if (DeviceIoControl(num, 2954240u, lpInBuffer, 8u, array, (uint)array.Length, ref lpBytesReturned, IntPtr.Zero) && lpBytesReturned >= 28)
 				{
-					return null;
+					short num2 = BitConverter.ToInt16(array, 12);
+					if (num2 > 0 && num2 <= 32)
+					{
+						short num3 = BitConverter.ToInt16(array, 26);
+						if (num3 > 0 && num3 < 150)
+						{
+							return num3;
+						}
+						if (num3 > 273 && num3 < 400)
+						{
+							return num3 - 273;
+						}
+					}
 				}
-				if (lpBytesReturned < 28)
+				// SMART 직접 읽기 폴백 (SATA HDD/SSD용)
+				// SMART_RCV_DRIVE_DATA (IOCTL 0x7C088)
+				byte[] smartIn = new byte[32];
+				smartIn[0] = 0xA0; // bFeaturesReg = SMART READ DATA
+				smartIn[2] = 1;    // bSectorCountReg
+				smartIn[4] = 0x4F; // bCylLowReg
+				smartIn[5] = 0xC2; // bCylHighReg
+				smartIn[6] = (byte)(0xA0 | ((physIdx & 1) << 4)); // bDriveHeadReg
+				smartIn[7] = 0xB0; // bCommandReg = SMART READ DATA
+				byte[] smartOut = new byte[512 + 16];
+				uint smartRet = 0u;
+				if (DeviceIoControl(num, 0x7C088u, smartIn, (uint)smartIn.Length, smartOut, (uint)smartOut.Length, ref smartRet, IntPtr.Zero) && smartRet >= 512 + 16)
 				{
-					return null;
-				}
-				short num2 = BitConverter.ToInt16(array, 12);
-				if (num2 <= 0 || num2 > 32)
-				{
-					return null;
-				}
-				short num3 = BitConverter.ToInt16(array, 26);
-				if (num3 > 0 && num3 < 150)
-				{
-					return num3;
-				}
-				if (num3 > 273 && num3 < 400)
-				{
-					return num3 - 273;
+					// SMART 데이터는 오프셋 16부터 시작, 각 속성 12바이트
+					for (int si = 16 + 2; si + 12 <= smartOut.Length; si += 12)
+					{
+						byte attrId = smartOut[si];
+						if (attrId == 194 || attrId == 190 || attrId == 231)
+						{
+							float tempVal = (int)smartOut[si + 5];
+							if (tempVal > 0f && tempVal < 120f)
+							{
+								return tempVal;
+							}
+						}
+					}
 				}
 			}
 			finally
@@ -613,20 +641,40 @@ internal class HwCollector : IDisposable
 			{
 				try
 				{
-					string key = Regex.Replace((item2["InstanceName"] != null) ? item2["InstanceName"].ToString() : "", "\\\\+\\d+$", "");
-					if (!dictionary2.TryGetValue(key, out var value) || !(item2["VendorSpecific"] is byte[] array))
+					string instName = ((item2["InstanceName"] != null) ? item2["InstanceName"].ToString() : "");
+					string key = Regex.Replace(instName, "\\\\+\\d+$", "");
+					int driveIndex = -1;
+					if (dictionary2.TryGetValue(key, out var exactVal))
+					{
+						driveIndex = exactVal;
+					}
+					else
+					{
+						// 부분 매칭 폴백: PNPDeviceID와 InstanceName 간 부분 일치 시도
+						foreach (KeyValuePair<string, int> kv in dictionary2)
+						{
+							if (key.IndexOf(kv.Key, StringComparison.OrdinalIgnoreCase) >= 0 ||
+								kv.Key.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0)
+							{
+								driveIndex = kv.Value;
+								break;
+							}
+						}
+					}
+					if (driveIndex < 0 || !(item2["VendorSpecific"] is byte[] array))
 					{
 						continue;
 					}
 					for (int i = 2; i + 12 <= array.Length; i += 12)
 					{
 						byte b = array[i];
-						if (b == 194 || b == 190)
+						// SMART 속성: 194(Temperature), 190(Airflow Temp), 231(SSD Temp)
+						if (b == 194 || b == 190 || b == 231)
 						{
 							float num = (int)array[i + 5];
-							if (num > 0f && num < 100f && !dictionary.ContainsKey(value))
+							if (num > 0f && num < 120f && !dictionary.ContainsKey(driveIndex))
 							{
-								dictionary[value] = num;
+								dictionary[driveIndex] = num;
 								break;
 							}
 						}
@@ -679,213 +727,358 @@ internal class HwCollector : IDisposable
 	{
 		try
 		{
-			StringBuilder stringBuilder = new StringBuilder("=== LHM Sensor Dump (after first collect) ===\n");
+			StringBuilder sb = new StringBuilder();
+			sb.AppendLine("YUNSEUL-S Sensor Diagnostic Log");
+			sb.AppendLine("Generated: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+			sb.AppendLine("OS: " + Environment.OSVersion.ToString());
+			sb.AppendLine("64bit: " + Environment.Is64BitOperatingSystem);
+			sb.AppendLine("============================================================");
+
+			// ── 1. LHM 전체 하드웨어/센서 덤프 ──
+			sb.AppendLine("\n[1] LibreHardwareMonitor - All Hardware & Sensors");
+			sb.AppendLine("------------------------------------------------------------");
 			foreach (IHardware item in _pc.Hardware)
 			{
-				stringBuilder.AppendLine("[" + item.HardwareType.ToString() + "] " + item.Name);
+				sb.AppendLine("  [" + item.HardwareType.ToString() + "] " + item.Name);
 				ISensor[] sensors = item.Sensors;
 				foreach (ISensor sensor in sensors)
 				{
-					stringBuilder.AppendLine("  " + sensor.SensorType.ToString() + " | " + sensor.Name + " = " + sensor.Value);
+					sb.AppendLine("    " + sensor.SensorType.ToString().PadRight(14) + " | " + sensor.Name.PadRight(28) + " = " + sensor.Value);
 				}
 				IHardware[] subHardware = item.SubHardware;
 				foreach (IHardware hardware in subHardware)
 				{
-					stringBuilder.AppendLine("  [Sub:" + hardware.HardwareType.ToString() + "] " + hardware.Name);
+					sb.AppendLine("    [Sub:" + hardware.HardwareType.ToString() + "] " + hardware.Name);
 					ISensor[] sensors2 = hardware.Sensors;
 					foreach (ISensor sensor2 in sensors2)
 					{
-						stringBuilder.AppendLine("    " + sensor2.SensorType.ToString() + " | " + sensor2.Name + " = " + sensor2.Value);
+						sb.AppendLine("      " + sensor2.SensorType.ToString().PadRight(14) + " | " + sensor2.Name.PadRight(28) + " = " + sensor2.Value);
 					}
 				}
 			}
-			stringBuilder.AppendLine("\n=== Thermal Zone Information (Performance Counter) ===");
+
+			// ── 2. GPU 온도 진단 ──
+			sb.AppendLine("\n[2] GPU Temperature Diagnosis");
+			sb.AppendLine("------------------------------------------------------------");
+			bool anyGpuMissing = false;
+			foreach (IHardware gpuHw in _pc.Hardware)
+			{
+				string gpuType = gpuHw.HardwareType.ToString();
+				if (gpuType != "GpuNvidia" && gpuType != "GpuAmd" && gpuType != "GpuIntel")
+					continue;
+
+				sb.AppendLine("  GPU: " + gpuHw.Name + " (Type=" + gpuType + ")");
+
+				// 직접 센서 나열
+				bool foundTemp = false;
+				ISensor[] gpuSensors = gpuHw.Sensors;
+				foreach (ISensor gs in gpuSensors)
+				{
+					if (gs.SensorType.ToString() == "Temperature")
+					{
+						sb.AppendLine("    [Sensor] " + gs.Name + " = " + gs.Value + (gs.Value.HasValue && gs.Value > 0f ? " OK" : " (empty/zero)"));
+						if (gs.Value.HasValue && gs.Value > 0f) foundTemp = true;
+					}
+				}
+				if (!foundTemp)
+					sb.AppendLine("    ** No direct Temperature sensor found on this GPU");
+
+				// SubHardware 센서
+				IHardware[] gpuSub = gpuHw.SubHardware;
+				if (gpuSub.Length > 0)
+				{
+					foreach (IHardware sub in gpuSub)
+					{
+						sb.AppendLine("    [SubHW:" + sub.HardwareType.ToString() + "] " + sub.Name);
+						ISensor[] subSensors = sub.Sensors;
+						foreach (ISensor ss in subSensors)
+						{
+							if (ss.SensorType.ToString() == "Temperature")
+							{
+								sb.AppendLine("      [Sensor] " + ss.Name + " = " + ss.Value);
+								if (ss.Value.HasValue && ss.Value > 0f) foundTemp = true;
+							}
+						}
+					}
+				}
+				else
+				{
+					sb.AppendLine("    No SubHardware");
+				}
+
+				if (!foundTemp && gpuType == "GpuIntel")
+				{
+					anyGpuMissing = true;
+					sb.AppendLine("    >> Intel iGPU has no temp sensor. Will use CPU Package temp as fallback.");
+				}
+				else if (!foundTemp)
+				{
+					anyGpuMissing = true;
+					sb.AppendLine("    >> WARNING: No temperature available for this GPU from any source.");
+				}
+			}
+			if (!anyGpuMissing)
+				sb.AppendLine("  All GPUs have temperature data.");
+
+			// ── 3. 마더보드 온도 센서 (CPU 폴백 소스) ──
+			sb.AppendLine("\n[3] Motherboard Temperature Sensors (CPU fallback source)");
+			sb.AppendLine("------------------------------------------------------------");
+			try
+			{
+				bool mbFound = false;
+				foreach (IHardware item5 in _pc.Hardware)
+				{
+					if (item5.HardwareType.ToString() != "Motherboard")
+						continue;
+					mbFound = true;
+					ISensor[] sensors3 = item5.Sensors;
+					foreach (ISensor sensor3 in sensors3)
+					{
+						if (sensor3.SensorType.ToString() == "Temperature")
+							sb.AppendLine("  [MB] " + sensor3.Name.PadRight(28) + " = " + sensor3.Value);
+					}
+					IHardware[] subHardware2 = item5.SubHardware;
+					foreach (IHardware hardware2 in subHardware2)
+					{
+						sb.AppendLine("  [Sub:" + hardware2.HardwareType.ToString() + "] " + hardware2.Name);
+						ISensor[] sensors4 = hardware2.Sensors;
+						foreach (ISensor sensor4 in sensors4)
+						{
+							if (sensor4.SensorType.ToString() == "Temperature")
+								sb.AppendLine("    " + sensor4.Name.PadRight(28) + " = " + sensor4.Value);
+						}
+					}
+				}
+				if (!mbFound)
+					sb.AppendLine("  No Motherboard hardware detected by LHM");
+			}
+			catch (Exception ex7)
+			{
+				sb.AppendLine("  Error: " + ex7.Message);
+			}
+
+			// ── 4. Thermal Zone (Performance Counter) ──
+			sb.AppendLine("\n[4] Thermal Zone Information (Performance Counter)");
+			sb.AppendLine("------------------------------------------------------------");
 			try
 			{
 				PerformanceCounterCategory performanceCounterCategory = new PerformanceCounterCategory("Thermal Zone Information");
 				string[] instanceNames = performanceCounterCategory.GetInstanceNames();
 				if (instanceNames.Length == 0)
-				{
-					stringBuilder.AppendLine("  No instances");
-				}
-				string[] array = instanceNames;
-				foreach (string text in array)
+					sb.AppendLine("  No instances");
+				foreach (string text in instanceNames)
 				{
 					try
 					{
 						using PerformanceCounter performanceCounter = new PerformanceCounter("Thermal Zone Information", "Temperature", text);
 						float num = performanceCounter.NextValue();
 						float num2 = num / 10f - 273.15f;
-						stringBuilder.AppendLine("  [" + text + "] raw=" + num + " => " + num2.ToString("0.0") + "C");
+						sb.AppendLine("  [" + text + "] raw=" + num + " => " + num2.ToString("0.0") + "C");
 					}
 					catch (Exception ex)
 					{
-						stringBuilder.AppendLine("  [" + text + "] err: " + ex.Message);
+						sb.AppendLine("  [" + text + "] err: " + ex.Message);
 					}
 				}
 			}
 			catch (Exception ex2)
 			{
-				stringBuilder.AppendLine("  Category error: " + ex2.Message);
+				sb.AppendLine("  Category error: " + ex2.Message);
 			}
-			stringBuilder.AppendLine("\n=== Drive Letter to Physical Index ===");
-			try
-			{
-				Dictionary<string, int> driveLetterToPhysicalIndex = GetDriveLetterToPhysicalIndex();
-				if (driveLetterToPhysicalIndex.Count == 0)
-				{
-					stringBuilder.AppendLine("  No mappings found");
-				}
-				foreach (KeyValuePair<string, int> item2 in driveLetterToPhysicalIndex)
-				{
-					stringBuilder.AppendLine("  " + item2.Key + " -> PhysDrive" + item2.Value);
-				}
-			}
-			catch (Exception ex3)
-			{
-				stringBuilder.AppendLine("  Error: " + ex3.Message);
-			}
-			stringBuilder.AppendLine("\n=== Disk Temps via IOCTL (StorageDeviceTemperatureProperty=22) ===");
-			try
-			{
-				Dictionary<string, int> driveLetterToPhysicalIndex2 = GetDriveLetterToPhysicalIndex();
-				HashSet<int> hashSet = new HashSet<int>();
-				foreach (KeyValuePair<string, int> item3 in driveLetterToPhysicalIndex2)
-				{
-					if (!hashSet.Contains(item3.Value))
-					{
-						hashSet.Add(item3.Value);
-						float? num3 = ReadDiskTempByIndex(item3.Value);
-						stringBuilder.AppendLine("  PhysDrive" + item3.Value + " (" + item3.Key + "): " + (num3.HasValue ? (num3.Value + "C") : "N/A"));
-					}
-				}
-			}
-			catch (Exception ex4)
-			{
-				stringBuilder.AppendLine("  Error: " + ex4.Message);
-			}
-			stringBuilder.AppendLine("\n=== Disk Temps via WMI SMART ===");
-			try
-			{
-				Dictionary<int, float?> smartTemps = GetSmartTemps();
-				if (smartTemps.Count == 0)
-				{
-					stringBuilder.AppendLine("  No SMART data found");
-				}
-				foreach (KeyValuePair<int, float?> item4 in smartTemps)
-				{
-					stringBuilder.AppendLine("  PhysDrive" + item4.Key + ": " + (item4.Value.HasValue ? (item4.Value.Value + "C") : "N/A"));
-				}
-			}
-			catch (Exception ex5)
-			{
-				stringBuilder.AppendLine("  Error: " + ex5.Message);
-			}
-			stringBuilder.AppendLine("\n=== WMI ACPI Thermal Zone (CPU fallback) ===");
+
+			// ── 5. WMI ACPI Thermal Zone ──
+			sb.AppendLine("\n[5] WMI ACPI Thermal Zone (CPU fallback)");
+			sb.AppendLine("------------------------------------------------------------");
 			try
 			{
 				float? wmiAcpiTemp = GetWmiAcpiTemp();
-				stringBuilder.AppendLine("  " + (wmiAcpiTemp.HasValue ? (wmiAcpiTemp.Value.ToString("0.0") + "C") : "N/A"));
+				sb.AppendLine("  Result: " + (wmiAcpiTemp.HasValue ? (wmiAcpiTemp.Value.ToString("0.0") + "C") : "N/A"));
 			}
 			catch (Exception ex6)
 			{
-				stringBuilder.AppendLine("  Error: " + ex6.Message);
+				sb.AppendLine("  Error: " + ex6.Message);
 			}
-			stringBuilder.AppendLine("\n=== Motherboard ALL Temperature Sensors ===");
+
+			// ── 6. 디스크 온도 진단 ──
+			sb.AppendLine("\n[6] Disk Temperature Diagnosis");
+			sb.AppendLine("------------------------------------------------------------");
+
+			// 6a. 드라이브 문자 -> 물리 인덱스 매핑
+			sb.AppendLine("  [6a] Drive Letter -> Physical Index Mapping");
+			Dictionary<string, int> letterMap = null;
 			try
 			{
-				foreach (IHardware item5 in _pc.Hardware)
-				{
-					if (item5.HardwareType.ToString() != "Motherboard")
-					{
-						continue;
-					}
-					ISensor[] sensors3 = item5.Sensors;
-					foreach (ISensor sensor3 in sensors3)
-					{
-						if (sensor3.SensorType.ToString() == "Temperature")
-						{
-							stringBuilder.AppendLine("  [MB] " + sensor3.Name + " = " + sensor3.Value);
-						}
-					}
-					IHardware[] subHardware2 = item5.SubHardware;
-					foreach (IHardware hardware2 in subHardware2)
-					{
-						stringBuilder.AppendLine("  [Sub:" + hardware2.HardwareType.ToString() + "] " + hardware2.Name);
-						ISensor[] sensors4 = hardware2.Sensors;
-						foreach (ISensor sensor4 in sensors4)
-						{
-							if (sensor4.SensorType.ToString() == "Temperature")
-							{
-								stringBuilder.AppendLine("    " + sensor4.Name + " = " + sensor4.Value);
-							}
-						}
-					}
-				}
+				letterMap = GetDriveLetterToPhysicalIndex();
+				if (letterMap.Count == 0)
+					sb.AppendLine("    No mappings found (WMI query returned empty)");
+				foreach (KeyValuePair<string, int> item2 in letterMap)
+					sb.AppendLine("    " + item2.Key + " -> PhysDrive" + item2.Value);
 			}
-			catch (Exception ex7)
+			catch (Exception ex3)
 			{
-				stringBuilder.AppendLine("  Error: " + ex7.Message);
+				sb.AppendLine("    Error: " + ex3.GetType().Name + ": " + ex3.Message);
 			}
-			stringBuilder.AppendLine("\n=== LHM Storage Hardware ===");
-			try
-			{
-				bool flag = false;
-				foreach (IHardware item6 in _pc.Hardware)
-				{
-					if (!(item6.HardwareType.ToString() != "Storage"))
-					{
-						flag = true;
-						stringBuilder.AppendLine("  " + item6.Name);
-						ISensor[] sensors5 = item6.Sensors;
-						foreach (ISensor sensor5 in sensors5)
-						{
-							stringBuilder.AppendLine("    " + sensor5.SensorType.ToString() + " | " + sensor5.Name + " = " + sensor5.Value);
-						}
-					}
-				}
-				if (!flag)
-				{
-					stringBuilder.AppendLine("  No Storage hardware found (IsStorageEnabled may have failed)");
-				}
-			}
-			catch (Exception ex8)
-			{
-				stringBuilder.AppendLine("  Error: " + ex8.Message);
-			}
-			stringBuilder.AppendLine("\n=== DiskInfoToolkit SMART Temps ===");
+
+			// 6b. DiskInfoToolkit SMART
+			sb.AppendLine("\n  [6b] DiskInfoToolkit SMART Temps");
 			try
 			{
 				if (!_diskToolkitOk)
 				{
-					stringBuilder.AppendLine("  StorageManager.ReloadStorages() failed");
+					sb.AppendLine("    StorageManager.ReloadStorages() FAILED at startup");
 				}
 				else
 				{
+					if (StorageManager.Storages.Count == 0)
+						sb.AppendLine("    No storages found by DiskInfoToolkit");
 					foreach (Storage storage in StorageManager.Storages)
 					{
 						try
 						{
 							storage.Update();
 							SmartInfo smart = storage.Smart;
-							stringBuilder.AppendLine("  PhysDrive" + storage.DriveNumber + " [" + storage.Model + "] NVMe=" + storage.IsNVMe + " Temp=" + ((smart != null && smart.Temperature.HasValue) ? (smart.Temperature.Value + "C") : "N/A"));
+							string tempStr = (smart != null && smart.Temperature.HasValue) ? (smart.Temperature.Value + "C") : "N/A";
+							sb.AppendLine("    PhysDrive" + storage.DriveNumber + " [" + storage.Model + "] NVMe=" + storage.IsNVMe + " Temp=" + tempStr);
 						}
 						catch (Exception ex9)
 						{
-							stringBuilder.AppendLine("  Error on drive: " + ex9.Message);
+							sb.AppendLine("    PhysDrive" + storage.DriveNumber + " Error: " + ex9.GetType().Name + ": " + ex9.Message);
 						}
-					}
-					if (StorageManager.Storages.Count == 0)
-					{
-						stringBuilder.AppendLine("  No storages found");
 					}
 				}
 			}
 			catch (Exception ex10)
 			{
-				stringBuilder.AppendLine("  Error: " + ex10.Message);
+				sb.AppendLine("    Error: " + ex10.GetType().Name + ": " + ex10.Message);
 			}
-			File.WriteAllText(Path.Combine(Program.BASE, "sensors_dump.txt"), stringBuilder.ToString());
+
+			// 6c. LHM Storage 센서
+			sb.AppendLine("\n  [6c] LHM Storage Hardware Sensors");
+			try
+			{
+				bool storageFound = false;
+				foreach (IHardware item6 in _pc.Hardware)
+				{
+					if (item6.HardwareType.ToString() != "Storage")
+						continue;
+					storageFound = true;
+					sb.AppendLine("    " + item6.Name);
+					ISensor[] sensors5 = item6.Sensors;
+					foreach (ISensor sensor5 in sensors5)
+						sb.AppendLine("      " + sensor5.SensorType.ToString().PadRight(14) + " | " + sensor5.Name.PadRight(28) + " = " + sensor5.Value);
+				}
+				if (!storageFound)
+					sb.AppendLine("    No Storage hardware found (IsStorageEnabled may have failed)");
+			}
+			catch (Exception ex8)
+			{
+				sb.AppendLine("    Error: " + ex8.GetType().Name + ": " + ex8.Message);
+			}
+
+			// 6d. IOCTL StorageDeviceTemperatureProperty + SMART 직접 읽기
+			sb.AppendLine("\n  [6d] IOCTL Disk Temp (StorageDeviceTemperatureProperty + SMART direct)");
+			try
+			{
+				if (letterMap != null)
+				{
+					HashSet<int> tested = new HashSet<int>();
+					foreach (KeyValuePair<string, int> item3 in letterMap)
+					{
+						if (!tested.Contains(item3.Value))
+						{
+							tested.Add(item3.Value);
+							float? ioctlTemp = ReadDiskTempByIndex(item3.Value);
+							sb.AppendLine("    PhysDrive" + item3.Value + " (" + item3.Key + "): " + (ioctlTemp.HasValue ? (ioctlTemp.Value + "C") : "N/A"));
+						}
+					}
+				}
+				else
+				{
+					sb.AppendLine("    Skipped (no drive letter mapping available)");
+				}
+			}
+			catch (Exception ex4)
+			{
+				sb.AppendLine("    Error: " + ex4.GetType().Name + ": " + ex4.Message);
+			}
+
+			// 6e. WMI SMART (MSStorageDriver_ATAPISmartData)
+			sb.AppendLine("\n  [6e] WMI SMART Temps (MSStorageDriver_ATAPISmartData)");
+			try
+			{
+				// PNPDeviceID 매핑 상세 로그
+				sb.AppendLine("    -- PNPDeviceID -> Index mapping:");
+				using (ManagementObjectSearcher pnpSearch = new ManagementObjectSearcher("SELECT Index, PNPDeviceID, Model FROM Win32_DiskDrive"))
+				{
+					foreach (ManagementObject mo in pnpSearch.Get())
+					{
+						string pnp = (mo["PNPDeviceID"] != null) ? mo["PNPDeviceID"].ToString() : "(null)";
+						string model = (mo["Model"] != null) ? mo["Model"].ToString() : "(null)";
+						sb.AppendLine("      Index=" + mo["Index"] + " Model=" + model + " PNP=" + pnp);
+					}
+				}
+				sb.AppendLine("    -- SMART InstanceName entries:");
+				try
+				{
+					using ManagementObjectSearcher smartSearch = new ManagementObjectSearcher("root\\WMI", "SELECT InstanceName FROM MSStorageDriver_ATAPISmartData");
+					foreach (ManagementObject mo2 in smartSearch.Get())
+					{
+						string inst = (mo2["InstanceName"] != null) ? mo2["InstanceName"].ToString() : "(null)";
+						string cleaned = Regex.Replace(inst, "\\\\+\\d+$", "");
+						sb.AppendLine("      Raw=" + inst);
+						sb.AppendLine("      Cleaned=" + cleaned);
+					}
+				}
+				catch (Exception exSmart)
+				{
+					sb.AppendLine("      MSStorageDriver_ATAPISmartData query error: " + exSmart.GetType().Name + ": " + exSmart.Message);
+				}
+				sb.AppendLine("    -- GetSmartTemps() result:");
+				Dictionary<int, float?> smartTemps = GetSmartTemps();
+				if (smartTemps.Count == 0)
+					sb.AppendLine("      No SMART temp data found");
+				foreach (KeyValuePair<int, float?> item4 in smartTemps)
+					sb.AppendLine("      PhysDrive" + item4.Key + ": " + (item4.Value.HasValue ? (item4.Value.Value + "C") : "N/A"));
+			}
+			catch (Exception ex5)
+			{
+				sb.AppendLine("    Error: " + ex5.GetType().Name + ": " + ex5.Message);
+			}
+
+			// ── 7. 최종 수집 결과 요약 ──
+			sb.AppendLine("\n[7] Final Collected Snapshot Summary");
+			sb.AppendLine("------------------------------------------------------------");
+			HwSnap snap;
+			lock (_lk) { snap = _snap; }
+			if (snap.Cpu != null)
+				sb.AppendLine("  CPU: " + snap.Cpu.Name + " Temp=" + (snap.Cpu.Temp.HasValue ? ((int)snap.Cpu.Temp.Value + "C") : "N/A"));
+			else
+				sb.AppendLine("  CPU: (not collected)");
+
+			for (int gi = 0; gi < snap.Gpus.Count; gi++)
+			{
+				GpuSnap g = snap.Gpus[gi];
+				string gpuTempStr = g.Temp.HasValue && g.Temp > 0f ? ((int)g.Temp.Value + "C") : "N/A";
+				sb.AppendLine("  GPU[" + gi + "]: " + g.Name + " Load=" + (int)g.Load + "% Temp=" + gpuTempStr
+					+ ((!g.Temp.HasValue || g.Temp <= 0f) ? "  << WARNING: no temp" : ""));
+			}
+			if (snap.Gpus.Count == 0)
+				sb.AppendLine("  GPU: (none detected)");
+
+			foreach (DiskSnap d in snap.Disks)
+			{
+				string diskTempStr = d.Temp.HasValue && d.Temp > 0f ? ((int)d.Temp.Value + "C") : "N/A";
+				sb.AppendLine("  Disk " + d.Mount + ": " + Fmt.Bytes((double)d.UsedGB * 1e9) + "/" + Fmt.Bytes((double)d.TotalGB * 1e9)
+					+ " Temp=" + diskTempStr
+					+ ((!d.Temp.HasValue || d.Temp <= 0f) ? "  << WARNING: no temp" : ""));
+			}
+			if (snap.Disks.Count == 0)
+				sb.AppendLine("  Disk: (none detected)");
+
+			sb.AppendLine("\n============================================================");
+			sb.AppendLine("End of diagnostic log. Send this file for troubleshooting.");
+
+			File.WriteAllText(Path.Combine(Program.BASE, "sensors_dump.txt"), sb.ToString());
 		}
 		catch
 		{
@@ -1231,6 +1424,37 @@ internal class HwCollector : IDisposable
 						{
 							gpuSnap.Temp = value4.Value;
 						}
+					}
+				}
+				// Intel 내장 GPU는 자체 온도 센서가 없는 경우가 많음
+				// SubHardware에서도 온도를 찾아보고, 그래도 없으면 CPU Package 온도를 사용
+				if (!gpuSnap.Temp.HasValue && text3 == "GpuIntel")
+				{
+					IHardware[] subHwGpu = item3.SubHardware;
+					foreach (IHardware shGpu in subHwGpu)
+					{
+						ISensor[] subSensors = shGpu.Sensors;
+						foreach (ISensor ss in subSensors)
+						{
+							if (ss.SensorType.ToString() == "Temperature" && ss.Value.HasValue && ss.Value > 0f)
+							{
+								gpuSnap.Temp = ss.Value.Value;
+								break;
+							}
+						}
+						if (gpuSnap.Temp.HasValue) break;
+					}
+				}
+				if (!gpuSnap.Temp.HasValue && text3 == "GpuIntel")
+				{
+					// CPU 다이에 통합된 내장 GPU이므로 CPU Package 온도를 폴백으로 사용
+					if (hwSnap.Cpu != null && hwSnap.Cpu.Temp.HasValue)
+					{
+						gpuSnap.Temp = hwSnap.Cpu.Temp;
+					}
+					else if (temp.HasValue)
+					{
+						gpuSnap.Temp = temp;
 					}
 				}
 				if (gpuSnap.MemTotalMB > 0f)
